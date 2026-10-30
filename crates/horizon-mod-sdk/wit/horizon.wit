@@ -1,0 +1,404 @@
+/// The contract between Horizon and its mods (docs/mods.md).
+///
+/// A mod is a WebAssembly component targeting the `mod` world. Each imported
+/// interface but `log` is a capability: the mod's manifest lists the ones it
+/// uses, the player sees them before turning the mod on, and the game refuses
+/// a component that imports one its manifest does not declare.
+package horizon:mods@0.1.0;
+
+/// The mod's log, in the game's log under the mod's id. Always granted.
+interface log {
+    enum level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+    /// One line in the game's log as `[mod <id>] message`, at that level.
+    write: func(level: level, message: string);
+}
+
+/// Capability `game-read`: the local player and the world clock.
+interface game {
+    record player {
+        /// Feet position, in blocks.
+        x: f64,
+        y: f64,
+        z: f64,
+        /// Degrees, as F3 shows them.
+        yaw: f32,
+        /// Degrees: -90 looks straight up, 90 straight down.
+        pitch: f32,
+        /// Hit points as vanilla counts them: 20 is full health without effects.
+        health: f32,
+        /// 0 to 20, as the hunger bar.
+        food: u32,
+        /// `minecraft:overworld`, `minecraft:the_nether`, ...
+        dimension: string,
+    }
+    record clock {
+        /// Ticks since the world was created.
+        game-time: u64,
+        /// 24000 ticks per day; 0 is 6:00 on the first day.
+        day-time: u64,
+    }
+    /// None on the title screen.
+    get-player: func() -> option<player>;
+    /// None on the title screen.
+    get-clock: func() -> option<clock>;
+}
+
+/// Capability `chat`: messages only the local player sees.
+interface chat {
+    /// Shown in chat after the mod's name, like a system message.
+    show: func(text: string);
+}
+
+/// Capability `hud`: one panel of text lines per mod, drawn by the game
+/// every frame until the mod changes or clears it (no call per frame).
+interface hud {
+    enum corner {
+        top-left,
+        top-right,
+        bottom-left,
+        bottom-right,
+    }
+    record line {
+        /// Plain text, up to 256 characters.
+        text: string,
+        /// 0xRRGGBB.
+        color: u32,
+    }
+    /// Replaces the mod's panel: up to 16 lines in that corner of the screen.
+    set-panel: func(corner: corner, lines: list<line>);
+    /// Removes the mod's panel.
+    clear: func();
+}
+
+/// Capability `storage`: a per-mod folder of small key/value files, quota'd
+/// (docs/mods.md). Keys are `[a-z0-9_.-]{1,64}`, one path segment.
+interface storage {
+    /// None if `key` has never been `set`, or the key is not well-formed.
+    get: func(key: string) -> option<list<u8>>;
+    /// Errs on a malformed key or over quota (bytes for the whole mod).
+    set: func(key: string, value: list<u8>) -> result<_, string>;
+    /// No error if `key` was already absent.
+    delete: func(key: string);
+}
+
+/// Capability `input`: right-clicks with items the mod claims, keybinds it
+/// registers, and clicks and typing on its screen (capability `ui`). Events queue up
+/// between calls; the mod collects them with `poll`, usually each tick.
+interface input {
+    /// An item stack as the mod sees it.
+    record held-item {
+        /// `minecraft:spyglass`, `mymod:wand`, ...
+        id: string,
+        count: u32,
+        /// 0-8 the hotbar, 40 the offhand.
+        slot: u32,
+        /// `minecraft:custom_name` as plain text.
+        custom-name: option<string>,
+        /// `minecraft:custom_data` as SNBT.
+        custom-data: option<string>,
+    }
+    record item-use {
+        item: held-item,
+        /// Game ticks the button was held (0 on `use-start`).
+        ticks: u32,
+    }
+    record click {
+        /// GUI pixels from the centre of the screen (as `ui.show` draws).
+        x: f32,
+        y: f32,
+        /// 0 left, 1 right, 2 middle.
+        button: u32,
+    }
+    variant event {
+        /// The use button went down with a claimed item in hand. The game does
+        /// nothing else with the click: no zoom, no placing, no swing.
+        use-start(item-use),
+        /// It came up again (or the player switched slots, or a screen opened).
+        use-stop(item-use),
+        /// A registered key went down or up while playing (no screen open).
+        key-down(string),
+        key-up(string),
+        /// A click on the mod's screen.
+        screen-click(click),
+        /// The player closed the mod's screen (Escape).
+        screen-closed,
+    }
+    /// A key pressed on the mod's screen (capability `ui`), held keys
+    /// repeating. Escape is the game's: it closes the screen.
+    variant typed {
+        /// The characters it typed, as a text box takes them (no control
+        /// characters).
+        text(string),
+        /// A key that types nothing (Backspace, Delete, Enter, Tab, the
+        /// arrows, Home, End, ...), as options.txt writes keys
+        /// (`key.keyboard.backspace`, `key.keyboard.enter`).
+        key(string),
+    }
+    /// Items whose use the mod handles instead of the game, by id. Replaces
+    /// the previous list.
+    claim-items: func(ids: list<string>);
+    /// A keybind, listed in Options > Controls under the mod's name, where
+    /// the player can rebind it: `name` is the mod's own (it comes back in
+    /// `key-down`), `label` what Controls shows, `key` the default as
+    /// options.txt writes keys (`key.keyboard.r`).
+    register-key: func(name: string, label: string, key: string);
+    /// The stack in the main hand, as of this tick.
+    held: func() -> option<held-item>;
+    /// The events since the last call, oldest first (at most 256 are kept).
+    poll: func() -> list<event>;
+    /// What was typed on the mod's screen since the last call, oldest first
+    /// (at most 256 are kept; what is left when the screen closes is
+    /// dropped). A mod with a text field calls it with `poll`, each tick.
+    poll-typed: func() -> list<typed>;
+}
+
+/// Capability `ui`: one screen the mod owns. The mod hands the game what to
+/// draw; the game draws it every frame, releases the mouse, and sends clicks
+/// and Escape back as `input` events. It does not pause the game.
+interface ui {
+    record rect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    }
+    record point {
+        x: f32,
+        y: f32,
+    }
+    variant draw {
+        /// A filled rectangle, colour 0xAARRGGBB.
+        fill(tuple<rect, u32>),
+        /// Any four-cornered shape (wheel segments, arrows), 0xAARRGGBB.
+        quad(tuple<list<point>, u32>),
+        /// A GUI sprite (`gui/sprites/...`, or a mod's `gui/...` texture)
+        /// stretched over a rectangle, tinted 0xAARRGGBB.
+        sprite(tuple<string, rect, u32>),
+        /// An item, drawn as the hotbar draws it, at 16 x 16 times `scale`.
+        /// The second string is an item model id to use instead (or empty).
+        item(tuple<string, string, point, f32>),
+        /// Text with a shadow, 0xRRGGBB; centred on `x` when the bool is set.
+        text(tuple<string, point, u32, bool>),
+    }
+    /// Opens the mod's screen (or redraws it): coordinates are GUI pixels
+    /// from the screen's centre, drawn in order.
+    show: func(draws: list<draw>);
+    /// Closes the mod's screen, if it is open (the player's Escape closes it too).
+    close: func();
+    /// The cursor in GUI pixels from the centre while the screen is open.
+    cursor: func() -> option<point>;
+}
+
+/// Capability `render`: a post-processing pass the mod supplies, drawn over
+/// the world (under the hand and the HUD), before a shader pack's own
+/// post-processing, if any.
+interface render {
+    /// The pass: a WGSL fragment shader with an `fs_main` entry, after the
+    /// mod pass prelude (docs/mods.md, "A mod's post pass": the world's
+    /// colour and depth, a `Frame` uniform and helpers). Compiled once per
+    /// distinct source; an error is logged and the pass skipped. A pass may
+    /// also draw its costly part at half size: `fs_half` and `fs_join`
+    /// beside `fs_main` (docs/mods.md, "A half-size stage").
+    set-post: func(wgsl: string);
+    /// Sixteen floats the pass reads as `frame.mod_params[0..4]`, kept until
+    /// changed. The pass runs only while some are set.
+    set-params: func(params: list<f32>);
+    /// Stops the pass: no source, no parameters and no data until the next
+    /// `set-post` and `set-params`.
+    clear-post: func();
+    /// Words the pass reads as `mod_data` (`var<storage, read> mod_data:
+    /// array<u32>`, binding 5 of the prelude; `bitcast<f32>` for floats),
+    /// kept until changed or the pass is cleared. Until some are set it
+    /// holds one word, 0: read `arrayLength(&mod_data)` before indexing.
+    /// Uploaded to the GPU only when they change. At most 262,144 words
+    /// (1 MiB) a call; more are ignored (logged).
+    set-data: func(words: list<u32>);
+    /// Shakes the camera: a jolt of `strength` (0 to 1, 1 the hardest) that
+    /// fades out over `seconds` (at most 30). Jolts add up. The game turns
+    /// the view (not the player) with smooth noise, scaled by the player's
+    /// Distortion Effects option.
+    shake: func(strength: f32, seconds: f32);
+}
+
+/// Capability `world`: the world around the player, and changes to it.
+/// Changes need a world this game runs (single player, or hosting LAN);
+/// on a remote server they are ignored and logged.
+interface %world {
+    record hit {
+        /// The block hit and the point on its face.
+        block-x: s32,
+        block-y: s32,
+        block-z: s32,
+        x: f64,
+        y: f64,
+        z: f64,
+        /// `minecraft:stone`, ...
+        block: string,
+    }
+    /// The first block along the player's view (fluids pass), up to
+    /// `distance` blocks (at most 1024; past the loaded chunks, across the
+    /// distant terrain when LOD Distance is on), as of this tick.
+    raycast: func(distance: f32) -> option<hit>;
+    /// Runs commands as the server would (operator level, no chat feedback),
+    /// in order, right after this call returns, all in this tick.
+    run-commands: func(commands: list<string>);
+    /// A sound event (vanilla's or a resource pack's) at a point, or
+    /// following the player when `at` is none.
+    play-sound: func(event: string, at: option<tuple<f64, f64, f64>>, volume: f32, pitch: f32);
+    /// The local player's flying speed (creative flight), as vanilla's
+    /// abilities hold it: 0.05 is vanilla's, sprinting doubles it, at most
+    /// 50. The game keeps it until the mod changes it or stops, through
+    /// respawns, game mode changes and other worlds; none (or a value that
+    /// is not a number) puts vanilla's back. A spectator keeps the scroll
+    /// wheel's speed. On a remote server it is ignored and logged.
+    set-flying-speed: func(speed: option<f32>);
+    /// Which of a column's heights a run's `y` counts from (vanilla's
+    /// heightmaps): one above the highest block that is not air, that blocks
+    /// motion or holds a fluid, that does so and is not leaves, or that is
+    /// solid.
+    enum heightmap {
+        world-surface,
+        motion-blocking,
+        motion-blocking-no-leaves,
+        ocean-floor,
+    }
+    /// A run of blocks up one column: `height` blocks from `y` up, set to
+    /// palette entry `block`.
+    record block-run {
+        x: s32,
+        z: s32,
+        /// The lowest block it changes: a height in the world, or with
+        /// `surface` the blocks over (under, when negative) the column's
+        /// height on that heightmap.
+        y: s32,
+        height: u32,
+        surface: option<heightmap>,
+        /// An index into the edit's `palette`.
+        block: u32,
+        /// An index into the edit's `filters`: only the blocks that match
+        /// it change. None changes every block of the run.
+        only: option<u32>,
+    }
+    /// Block changes made at once, straight into the world's chunk sections
+    /// (see `edit-blocks`).
+    record block-edit {
+        /// The block states the runs set, as commands write them:
+        /// `minecraft:stone`, `minecraft:oak_log[axis=x]`.
+        palette: list<string>,
+        /// What a run may require of the block it replaces, as `fill ...
+        /// replace` takes it: `minecraft:air`, `#minecraft:logs`.
+        filters: list<string>,
+        /// Made in order, each seeing the changes of those before it.
+        runs: list<block-run>,
+    }
+    /// Sets many blocks at once, far faster than `fill` and `setblock`: a
+    /// run per span of a column, each block its own palette entry if need
+    /// be. Made on the world's thread right after this call returns, in
+    /// order with `run-commands`, as `fill ... strict` makes them: nothing
+    /// round them is told (no neighbour or shape updates, no drops, sand and
+    /// gravel stay up, water and lava keep still), and a block entity goes
+    /// with its block. Light is worked out again once for each chunk
+    /// changed, off the world's thread, each chunk is remeshed once, and the
+    /// players who see a chunk are sent it whole. Heights (`surface`) are read
+    /// before any of the edit's changes. Only loaded chunks change, within
+    /// the world's height; the rest of a run is left out. At most 1,048,576
+    /// runs and 4,096 palette entries and filters a call. A block or filter
+    /// that does not parse, or an index past the end, leaves the whole edit
+    /// out (logged). On a remote server it is ignored and logged.
+    edit-blocks: func(edit: block-edit);
+    /// The answer to a `surface-height` query: its `tag`, and for each of
+    /// its columns, in order, the height asked for (one above the highest
+    /// block that counts on that heightmap, as `edit-blocks` reads it), or
+    /// none where the column's chunk is not loaded.
+    record surface-heights {
+        tag: u32,
+        heights: list<option<s32>>,
+    }
+    /// Asks the world for the height of each of `columns` (x, z) on
+    /// `heightmap`. The world is read where `edit-blocks` changes it, on its
+    /// own thread, in order with `run-commands` and `edit-blocks` (a query
+    /// made after an edit sees it), and the answer comes back through
+    /// `poll-surface-heights`, with the `tag` given here: a tick or two later
+    /// in single player (the world answers between two of its ticks; the mod
+    /// never waits on it). Chunks a mod keeps loaded (`forceload`) are read
+    /// as any other. At most 65,536 columns a call; a query with more is left
+    /// out (logged). On a remote server every height is none, answered at
+    /// once.
+    surface-height: func(tag: u32, columns: list<tuple<s32, s32>>, heightmap: heightmap);
+    /// The answers to `surface-height` queries that came back since the
+    /// last call, oldest first.
+    poll-surface-heights: func() -> list<surface-heights>;
+    /// The answer to a `read-columns` query: its `tag`; the names of the
+    /// blocks it saw (`minecraft:snow`, without their properties), which
+    /// `blocks` index; for each of its columns, in order, the height it
+    /// counted from (as `surface-height` answers it), or none where the
+    /// column's chunk is not loaded; and each column's blocks, `below` +
+    /// `above` of them a column, bottom first: from `below` under that
+    /// height up to `above` - 1 over it (a column that is not loaded, and
+    /// what is outside the world's height, reads as air); and each column's
+    /// biome tints, three a column: the grass's, the foliage's and the
+    /// water's colour there (0xRRGGBB, as the game tints its blocks; 0 where
+    /// the column is not loaded).
+    record column-blocks {
+        tag: u32,
+        palette: list<string>,
+        bases: list<option<s32>>,
+        blocks: list<u16>,
+        tints: list<u32>,
+    }
+    /// Asks the world for the blocks of each of `columns` (x, z) round its
+    /// height on `heightmap`: `below` blocks under it and `above` from it
+    /// up. Read and answered as `surface-height` is, in order with
+    /// `run-commands` and `edit-blocks`, through `poll-columns` with the
+    /// `tag` given here, a tick or two later in single player. At most
+    /// 65,536 columns, 64 blocks a column and 1,048,576 blocks a call; a
+    /// query with more is left out (logged). On a remote server every
+    /// column is none, answered at once.
+    read-columns: func(tag: u32, columns: list<tuple<s32, s32>>, heightmap: heightmap, below: u32, above: u32);
+    /// The answers to `read-columns` queries that came back since the last
+    /// call, oldest first.
+    poll-columns: func() -> list<column-blocks>;
+}
+
+/// What the game calls. Only the hooks `init` asks for are ever called.
+interface events {
+    record registration {
+        /// Chat commands, without the slash. A name vanilla already uses is
+        /// refused (vanilla's command runs).
+        commands: list<string>,
+        /// Call `tick` every game tick (20 per second while playing).
+        tick: bool,
+        /// Call `frame` every rendered frame. Budget: 0.1 ms.
+        frame: bool,
+        /// Call `chat` for each chat line the player receives.
+        chat: bool,
+    }
+    /// Once, after loading. An error keeps the mod off and is shown.
+    init: func() -> result<registration, string>;
+    /// Each game tick while in a world, with the game's tick counter.
+    tick: func(tick: u64);
+    /// Each rendered frame, with the seconds since the last one.
+    frame: func(seconds: f32);
+    /// `/name args`: ok(some(text)) is shown as feedback, err(text) in red.
+    command: func(name: string, args: string) -> result<option<string>, string>;
+    /// Each chat line the player receives, as plain text.
+    chat: func(text: string);
+}
+
+world horizon-mod {
+    import log;
+    import game;
+    import chat;
+    import hud;
+    import storage;
+    import input;
+    import ui;
+    import render;
+    import %world;
+    export events;
+}
